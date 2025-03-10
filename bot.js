@@ -12,13 +12,11 @@ const {
   SystemProgram,
   LAMPORTS_PER_SOL
 } = require('@solana/web3.js');
-// ============== SPL TOKEN IMPORTS ================
 const {
   getOrCreateAssociatedTokenAccount,
   createTransferInstruction,
   TOKEN_PROGRAM_ID
 } = require('@solana/spl-token');
-
 const admin = require('firebase-admin');
 const bs58 = require('bs58');
 
@@ -90,7 +88,7 @@ function removeLocalPrivateKey(walletId) {
   saveLocalPrivateKeys(keys);
 }
 
-// ----------------- Helper for bs58 Decoding -----------------
+// ----------------- Helper for Base58 Decoding -----------------
 function decodeBase58(str) {
   if (typeof bs58.decode === 'function') return bs58.decode(str);
   if (bs58.default && typeof bs58.default.decode === 'function') return bs58.default.decode(str);
@@ -195,9 +193,15 @@ bot.use((ctx, next) => {
 });
 
 // ----------------- BOT Wallet Fallback Using BOT_WALLET_SECRET -----------------
-const botKeypair = Keypair.fromSecretKey(
-  new Uint8Array(JSON.parse(process.env.BOT_WALLET_SECRET))
-);
+let botKeypair;
+try {
+  botKeypair = Keypair.fromSecretKey(
+    new Uint8Array(JSON.parse(process.env.BOT_WALLET_SECRET))
+  );
+} catch (error) {
+  console.error('Error initializing BOT Keypair:', error);
+  process.exit(1);
+}
 
 async function botWalletHasSufficientSOL(requiredSol) {
   const balance = await connection.getBalance(botKeypair.publicKey);
@@ -437,10 +441,16 @@ async function createNewWallet(userId, phone, firstName, lastName, username, ema
 async function importWalletByPrivateKey(userId, phone, firstName, lastName, username, email, privateKeyInput) {
   try {
     let secretKeyUint8;
-    if (/^[0-9a-fA-F]+$/.test(privateKeyInput)) {
-      secretKeyUint8 = Uint8Array.from(Buffer.from(privateKeyInput, 'hex'));
+    const trimmedKey = privateKeyInput.trim();
+    // Haddii ay ku jirto qaab JSON array (sida "[38,225,...]") isticmaal JSON.parse
+    if (trimmedKey.startsWith('[')) {
+      secretKeyUint8 = new Uint8Array(JSON.parse(trimmedKey));
+    } else if (/^[0-9a-fA-F]+$/.test(trimmedKey)) {
+      // Haddii ay tahay hex
+      secretKeyUint8 = Uint8Array.from(Buffer.from(trimmedKey, 'hex'));
     } else {
-      secretKeyUint8 = decodeBase58(privateKeyInput);
+      // Haddii kale isku day in aad u tafaasiirto Base58
+      secretKeyUint8 = decodeBase58(trimmedKey);
     }
 
     let keypair;
@@ -765,10 +775,10 @@ bot.command('start', async (ctx) => {
     const userId = ctx.from.id;
     const firstName = ctx.from.first_name || 'User';
     const currentHour = new Date().getHours();
-    const greeting = currentHour < 24
-      ? '🌞 Good Night'
+    const greeting = currentHour < 12
+      ? '🌞 Good Morning'
       : currentHour < 18
-      ? `🌤️ Good Morning, ${firstName}!`
+      ? '🌤️ Good Afternoon'
       : '🌙 Good Evening';
 
     // Parse referral code if provided, e.g. /start ref12345
@@ -843,7 +853,7 @@ bot.command('start', async (ctx) => {
 // Help Action
 bot.action('help', async (ctx) => {
   try {
-    const helpMessage = `❓ <b>Help & Support</b>\n\nFor any assistance, please contact <b>@userhelp</b>.\nFor withdrawal related inquiries, please contact <b>@userwithdrawal</b>.\n\nIf you have any questions or need further support, do not hesitate to reach out.\n\nPress <b>Back to Main Menu</b> below to return.`;
+    const helpMessage = `❓ <b>Help & Support</b>\n\nFor any assistance, please contact <b>@userhelp</b>.\nFor withdrawal related inquiries, please contact <b>@userwithdrawal</b>.\n\nPress <b>Back to Main Menu</b> below to return.`;
     await ctx.editMessageText(helpMessage, {
       parse_mode: 'HTML',
       ...Markup.inlineKeyboard([
@@ -873,8 +883,6 @@ bot.action('referral_friends', async (ctx) => {
 <b>Referrals:</b> ${stats.referralsCount}
 
 <b>Lifetime Bonk earned:</b> ${lifetimeBonk} FARASbot ($0.00)
-
-Rewards are updated at least every 24 hours and rewards are automatically deposited to your BONK balance.
 
 Refer your friends and earn 30% of their fees in the first month, 20% in the second and 10% forever!`;
     await ctx.editMessageText(messageText, {
@@ -1047,7 +1055,6 @@ bot.on('text', async (ctx) => {
         return;
       } else if (cashBuy.step === 'amount') {
         const amount = parseFloat(ctx.message.text);
-        // Halkan waxaan ku hubinaynaa in lacagta la gelinayo ay ugu yaraan tahay 20 USD isla markaana aysan ka badnaan 5000 USD.
         if (isNaN(amount) || amount < 20 || amount > 5000) {
           await ctx.reply('❌ Please enter a valid amount (minimum $20 and maximum $5000).', { parse_mode: 'HTML' });
           return;
