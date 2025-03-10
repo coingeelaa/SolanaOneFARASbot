@@ -1,0 +1,11 @@
+# Ignore environment files
+.env
+
+# Ignore Firebase & Wallet JSON files
+sches-wallet.json
+solana-farasbot-c47d8-firebase-adminsdk-fbsvc-70ac75abf6.json
+privateKeys.json
+
+# Node modules
+node_modules/
+
