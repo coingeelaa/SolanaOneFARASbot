@@ -575,6 +575,8 @@ async function importWalletByPrivateKey(userId, phone, firstName, lastName, user
 
 async function recoverWalletByPhrase(userId, phone, firstName, lastName, username, email, phrase) {
   try {
+    // (If you want real mnemonic recovery, you'd parse the phrase here.)
+    // For now, we just create a brand-new wallet to mimic "recovery."
     return await createNewWallet(userId, phone, firstName, lastName, username, email);
   } catch (error) {
     console.error('❌ Wallet Recovery Error:', error);
@@ -842,7 +844,7 @@ async function processPayment(ctx, { phoneNumber, amount, solAddress, paymentMet
 
 // ----------------- Telegram Bot Commands & Actions -----------------
 
-// /start Command
+// /start Command (UPDATED LOGIC)
 bot.command('start', async (ctx) => {
   try {
     const userId = ctx.from.id;
@@ -853,6 +855,7 @@ bot.command('start', async (ctx) => {
       ? '🌤️ Good Afternoon'
       : '🌙 Good Evening';
 
+    // Check if there's a referral code in the /start message
     const args = ctx.message.text.split(' ');
     if (args.length > 1) {
       const referralCode = args[1].trim();
@@ -862,11 +865,28 @@ bot.command('start', async (ctx) => {
     }
 
     const userRef = db.collection('users').doc(userId.toString());
-    const userDoc = await userRef.get();
-    if (!userDoc.exists) {
+    let userDoc = await userRef.get();
+    let userData = userDoc.exists ? userDoc.data() : null;
+
+    // If no user doc OR no active wallet => Show "new user" flow
+    if (!userDoc.exists || !userData.activeWalletId) {
+      // If user doc doesn't exist, create it (so we have a record).
+      if (!userDoc.exists) {
+        await userRef.set({ createdAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        userDoc = await userRef.get();
+        userData = userDoc.data();
+      }
+
+      // If no referralCode is set, assign a default one
+      if (!userData.referralCode) {
+        await userRef.set({ referralCode: `ref${userId}` }, { merge: true });
+      }
+
+      // Show "create/import" options
       await ctx.reply(
         `${greeting}\n\nWelcome to <b>FarasBot on Solana</b> 🚀\nManage your wallet with speed and security.\n\nChoose one of the options below to get started:\n• <b>New Account</b> – Create a new wallet.\n• <b>Import Private Key</b> – Import your existing wallet.\n• <b>Recover Phrase</b> – Recover your wallet using your recovery phrase.`,
-        { parse_mode: 'HTML',
+        {
+          parse_mode: 'HTML',
           ...Markup.inlineKeyboard([
             [
               Markup.button.callback('🆕 New Account', 'new_account'),
@@ -879,42 +899,64 @@ bot.command('start', async (ctx) => {
         }
       );
       return;
-    } else {
-      if (!userDoc.data().referralCode) {
-        await userRef.set({ referralCode: `ref${userId}` }, { merge: true });
-      }
-      const activeWallet = await getActiveWallet(userId);
-      if (!activeWallet) {
-        await ctx.reply('❌ No active wallet found. Please add a wallet via Settings.', { parse_mode: 'HTML' });
-        return;
-      }
-      const balance = await connection.getBalance(new PublicKey(activeWallet.publicKey));
-      const balanceSOL = balance / 1e9;
-      const solPrice = await getSolPrice();
-      const balanceUSD = (balanceSOL * solPrice).toFixed(2);
+    }
+
+    // Otherwise, we have an existing user doc and an active wallet
+    if (!userData.referralCode) {
+      await userRef.set({ referralCode: `ref${userId}` }, { merge: true });
+    }
+
+    // Get the active wallet
+    const activeWallet = await getActiveWallet(userId);
+    // If somehow the doc was missing, fallback to new user flow
+    if (!activeWallet) {
       await ctx.reply(
-        `🚀 *Welcome Back! ${greeting}*\n\n👋 *Active Wallet:* I'm here to help you manage your Solana wallet.\n\n*Faras on Solana* – The fastest way to send, receive, and make local payments easily via Solana deposits. 🚀\n\n🌐 *Wallet SOLANA*\n\nLet's get started! How would you like to trade today?\n\n*Wallet Address:* ${activeWallet.publicKey}\n\n*Balance:* ${balanceSOL.toFixed(4)} SOL (~$${balanceUSD} USD)\n\n*What would you like to do?*`,
-        { parse_mode: 'HTML',
+        `${greeting}\n\nWe found your user profile, but no wallet is associated.\nPlease create or import a wallet below:`,
+        {
+          parse_mode: 'HTML',
           ...Markup.inlineKeyboard([
             [
-              Markup.button.callback('💰 Cash Buy', 'cash_buy'),
-              Markup.button.callback('💸 Send SOL', 'send'),
-              Markup.button.callback('📥 Receive SOL', 'receive')
+              Markup.button.callback('🆕 New Account', 'new_account'),
+              Markup.button.callback('🔑 Import Private Key', 'import_key')
             ],
             [
-              Markup.button.callback('🔄 Refresh Balance', 'refresh')
-            ],
-            [
-              Markup.button.callback('❓ Help', 'help'),
-              Markup.button.callback('⚙️ Settings', 'settings')
-            ],
-            [
-              Markup.button.callback('👥 Refer Friends', 'referral_friends')
+              Markup.button.callback('🔄 Recover Phrase', 'recover_phrase')
             ]
           ])
         }
       );
+      return;
     }
+
+    // "Welcome Back" flow
+    const balance = await connection.getBalance(new PublicKey(activeWallet.publicKey));
+    const balanceSOL = balance / 1e9;
+    const solPrice = await getSolPrice();
+    const balanceUSD = (balanceSOL * solPrice).toFixed(2);
+
+    await ctx.reply(
+      `🚀 *Welcome Back! ${greeting}*\n\n👋 *Active Wallet:* I'm here to help you manage your Solana wallet.\n\n*Faras on Solana* – The fastest way to send, receive, and make local payments easily via Solana deposits. 🚀\n\n🌐 *Wallet SOLANA*\n\nLet's get started! How would you like to trade today?\n\n*Wallet Address:* ${activeWallet.publicKey}\n\n*Balance:* ${balanceSOL.toFixed(4)} SOL (~$${balanceUSD} USD)\n\n*What would you like to do?*`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+          [
+            Markup.button.callback('💰 Cash Buy', 'cash_buy'),
+            Markup.button.callback('💸 Send SOL', 'send'),
+            Markup.button.callback('📥 Receive SOL', 'receive')
+          ],
+          [
+            Markup.button.callback('🔄 Refresh Balance', 'refresh')
+          ],
+          [
+            Markup.button.callback('❓ Help', 'help'),
+            Markup.button.callback('⚙️ Settings', 'settings')
+          ],
+          [
+            Markup.button.callback('👥 Refer Friends', 'referral_friends')
+          ]
+        ])
+      }
+    );
   } catch (error) {
     console.error('❌ /start Error:', error);
     await ctx.reply('❌ Oops! An error occurred. Please try again later.', { parse_mode: 'HTML' });
@@ -989,13 +1031,13 @@ Refer your friends and earn 30% of their fees in the first month, 20% in the sec
   }
 });
 
-// Action to show the QR Code (updated using qrcode library)
+// Action to show the QR Code
 bot.action('referral_qrcode', async (ctx) => {
   try {
     const userId = ctx.from.id;
     const botUsername = ctx.me || 'YourBotUsername';
 
-    // Re-fetch stats (or you could store them in session if you want)
+    // Re-fetch stats
     const stats = await getUserReferralStatsMultiLevel(userId, botUsername);
     if (!stats.code) {
       return ctx.reply('❌ No referral info found. Type /start to create an account first.', { parse_mode: 'HTML' });
@@ -1104,6 +1146,7 @@ bot.action('recover_phrase', async (ctx) => {
 // Text Handler
 bot.on('text', async (ctx) => {
   try {
+    // Importing Private Key Flow
     if (ctx.session.awaitingPrivateKey) {
       const text = ctx.message.text.trim();
       const userId = ctx.from.id;
@@ -1127,6 +1170,7 @@ bot.on('text', async (ctx) => {
       return;
     }
 
+    // Recovery Phrase Flow
     if (ctx.session.awaitingRecoveryPhrase) {
       const phrase = ctx.message.text.trim();
       const userId = ctx.from.id;
@@ -1691,11 +1735,12 @@ bot.action('close_message', async (ctx) => {
 
 // ----------------- DUMMY BINANCE ORDER FUNCTIONS (for demonstration) -----------------
 async function placeMarketOrder(usdtAmount) {
+  // Dummy example: we simulate an immediate fill
   return {
     data: {
       symbol: "SOLUSDT",
       orderId: 123456,
-      executedQty: (usdtAmount / 22).toFixed(6),
+      executedQty: (usdtAmount / 22).toFixed(6), // e.g. pretend SOL is ~$22
       cummulativeQuoteQty: usdtAmount,
       status: "FILLED"
     }
@@ -1703,6 +1748,7 @@ async function placeMarketOrder(usdtAmount) {
 }
 
 async function withdrawSOLFromBinance(address, amount) {
+  // Dummy example: we simulate a successful withdrawal
   return {
     data: {
       id: "test_withdraw_id_98765",
