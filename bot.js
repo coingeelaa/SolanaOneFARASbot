@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
+const QRCode = require('qrcode'); // QRCode library added
 const { Telegraf, Markup, session } = require('telegraf');
 const {
   Connection,
@@ -988,7 +989,7 @@ Refer your friends and earn 30% of their fees in the first month, 20% in the sec
   }
 });
 
-// Action to show the QR Code (with logo in center)
+// Action to show the QR Code (updated using qrcode library)
 bot.action('referral_qrcode', async (ctx) => {
   try {
     const userId = ctx.from.id;
@@ -1000,13 +1001,17 @@ bot.action('referral_qrcode', async (ctx) => {
       return ctx.reply('❌ No referral info found. Type /start to create an account first.', { parse_mode: 'HTML' });
     }
 
-    // quickchart.io with centerImageUrl param
-    // Insert your own logo link below
-    const centerLogo = 'https://i.ibb.co/3NJPW5n/logo.png'; // <-- put your real logo link
-    const encodedLink = encodeURIComponent(stats.link);
-    const qrUrl = `https://quickchart.io/qr?size=300&text=${encodedLink}&centerImageUrl=${encodeURIComponent(centerLogo)}`;
+    // Generate QR code using the qrcode library
+    const referralLink = stats.link;
+    const options = {
+      errorCorrectionLevel: 'H',
+      type: 'image/png',
+      width: 300,
+    };
 
-    await ctx.replyWithPhoto(qrUrl, {
+    const qrBuffer = await QRCode.toBuffer(referralLink, options);
+
+    await ctx.replyWithPhoto({ source: qrBuffer, filename: 'qrcode.png' }, {
       caption: `Here is your referral QR code!\n\n<code>${stats.link}</code>`,
       parse_mode: 'HTML',
       ...Markup.inlineKeyboard([
