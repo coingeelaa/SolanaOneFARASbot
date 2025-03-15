@@ -239,6 +239,12 @@ async function registerReferral(userId, referralCode) {
   }
 }
 
+/**
+ * updateReferralBonus():
+ *   Bisha 1 (monthDiff=0): 25%
+ *   Bisha 2 (monthDiff=1): 15%
+ *   Bisha 3+ (monthDiff >=2): 5%
+ */
 async function updateReferralBonus(referrerCode, feePaid, transactionData, referredUserId) {
   try {
     const referredUserRef = db.collection('users').doc(referredUserId.toString());
@@ -257,13 +263,11 @@ async function updateReferralBonus(referrerCode, feePaid, transactionData, refer
     const yearDiff = now.getFullYear() - joinedDate.getFullYear();
     const monthDiff = (yearDiff * 12) + (now.getMonth() - joinedDate.getMonth());
 
-    let bonusPercentage = 0.10;
+    let bonusPercentage = 0.05; // default
     if (monthDiff === 0) {
-      bonusPercentage = 0.30;
+      bonusPercentage = 0.25;
     } else if (monthDiff === 1) {
-      bonusPercentage = 0.20;
-    } else {
-      bonusPercentage = 0.10;
+      bonusPercentage = 0.15;
     }
 
     const bonusAmount = feePaid * bonusPercentage;
@@ -301,11 +305,63 @@ async function updateReferralBonus(referrerCode, feePaid, transactionData, refer
   }
 }
 
-async function getUserReferralStats(userId, botUsername) {
+/**
+ * BFS to gather direct + indirect referrals
+ */
+async function getAllReferrals(referralCode, maxDepth = 5) {
+  const queue = [{ code: referralCode, level: 0 }];
+  const visited = new Set([referralCode]);
+
+  const directRefs = [];
+  const indirectRefs = [];
+
+  while (queue.length > 0) {
+    const { code: currentCode, level } = queue.shift();
+    if (level >= maxDepth) continue;
+
+    const snapshot = await db.collection('users')
+      .where('referredBy', '==', currentCode)
+      .get();
+
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      if (!data.referralCode) continue;
+
+      if (!visited.has(data.referralCode)) {
+        visited.add(data.referralCode);
+
+        if (level === 0) {
+          directRefs.push(data);
+        } else {
+          indirectRefs.push(data);
+        }
+
+        queue.push({ code: data.referralCode, level: level + 1 });
+      }
+    }
+  }
+
+  return { directRefs, indirectRefs };
+}
+
+/**
+ * getUserReferralStatsMultiLevel():
+ *   - BFS for direct/indirect
+ *   - sum of bonuses (paid vs unpaid)
+ */
+async function getUserReferralStatsMultiLevel(userId, botUsername) {
   const userRef = db.collection('users').doc(userId.toString());
   const userDoc = await userRef.get();
   if (!userDoc.exists) {
-    return { code: null, link: null, referralsCount: 0, lifetimeBonk: 0 };
+    return {
+      code: null,
+      link: null,
+      directCount: 0,
+      indirectCount: 0,
+      totalRewards: 0,
+      totalPaid: 0,
+      totalUnpaid: 0,
+    };
   }
 
   let code = userDoc.data().referralCode;
@@ -313,20 +369,39 @@ async function getUserReferralStats(userId, botUsername) {
     code = `ref${userId}`;
     await userRef.set({ referralCode: code }, { merge: true });
   }
-
   const link = `https://t.me/${botUsername}?start=${code}`;
 
-  const snapshot = await db.collection('referralBonuses').where('referrerCode', '==', code).get();
-  let referralsSet = new Set();
-  let lifetimeBonk = 0;
+  const { directRefs, indirectRefs } = await getAllReferrals(code, 5);
+  const directCount = directRefs.length;
+  const indirectCount = indirectRefs.length;
+
+  const snapshot = await db.collection('referralBonuses')
+    .where('referrerCode', '==', code)
+    .get();
+
+  let totalRewards = 0;
+  let totalPaid = 0;
+  let totalUnpaid = 0;
   snapshot.forEach(doc => {
     const data = doc.data();
-    referralsSet.add(data.referredUserId);
-    lifetimeBonk += (data.bonusAmount || 0);
+    const amt = data.bonusAmount || 0;
+    totalRewards += amt;
+    if (data.farasbotTransferSignature) {
+      totalPaid += amt;
+    } else {
+      totalUnpaid += amt;
+    }
   });
-  const referralsCount = referralsSet.size;
 
-  return { code, link, referralsCount, lifetimeBonk };
+  return {
+    code,
+    link,
+    directCount,
+    indirectCount,
+    totalRewards,
+    totalPaid,
+    totalUnpaid
+  };
 }
 
 // ----------------- Helper Functions for Solana -----------------
@@ -442,14 +517,11 @@ async function importWalletByPrivateKey(userId, phone, firstName, lastName, user
   try {
     let secretKeyUint8;
     const trimmedKey = privateKeyInput.trim();
-    // Haddii ay ku jirto qaab JSON array (sida "[38,225,...]") isticmaal JSON.parse
     if (trimmedKey.startsWith('[')) {
       secretKeyUint8 = new Uint8Array(JSON.parse(trimmedKey));
     } else if (/^[0-9a-fA-F]+$/.test(trimmedKey)) {
-      // Haddii ay tahay hex
       secretKeyUint8 = Uint8Array.from(Buffer.from(trimmedKey, 'hex'));
     } else {
-      // Haddii kale isku day in aad u tafaasiirto Base58
       secretKeyUint8 = decodeBase58(trimmedKey);
     }
 
@@ -773,7 +845,6 @@ async function processPayment(ctx, { phoneNumber, amount, solAddress, paymentMet
 bot.command('start', async (ctx) => {
   try {
     const userId = ctx.from.id;
-    const firstName = ctx.from.first_name || 'User';
     const currentHour = new Date().getHours();
     const greeting = currentHour < 12
       ? '🌞 Good Morning'
@@ -781,7 +852,6 @@ bot.command('start', async (ctx) => {
       ? '🌤️ Good Afternoon'
       : '🌙 Good Evening';
 
-    // Parse referral code if provided, e.g. /start ref12345
     const args = ctx.message.text.split(' ');
     if (args.length > 1) {
       const referralCode = args[1].trim();
@@ -867,34 +937,107 @@ bot.action('help', async (ctx) => {
   }
 });
 
-// referral_friends
+// -------------- REFERRAL FRIENDS --------------
 bot.action('referral_friends', async (ctx) => {
   try {
     const userId = ctx.from.id;
     const botUsername = ctx.me || 'YourBotUsername';
-    const stats = await getUserReferralStats(userId, botUsername);
+
+    // Fetch multi-level stats
+    const stats = await getUserReferralStatsMultiLevel(userId, botUsername);
     if (!stats.code) {
       return ctx.reply('❌ No referral info found. Type /start to create an account first.', { parse_mode: 'HTML' });
     }
-    const lifetimeBonk = stats.lifetimeBonk.toFixed(2);
-    const messageText = 
-`<b>Your reflink:</b> <a href="${stats.link}">${stats.link}</a>
 
-<b>Referrals:</b> ${stats.referralsCount}
+    const solPrice = await getSolPrice() || 20; // fallback
+    const totalRewardsUSD = (stats.totalRewards * solPrice).toFixed(2);
+    const totalPaidUSD = (stats.totalPaid * solPrice).toFixed(2);
+    const totalUnpaidUSD = (stats.totalUnpaid * solPrice).toFixed(2);
 
-<b>Lifetime Bonk earned:</b> ${lifetimeBonk} FARASbot ($0.00)
+    const totalRefCount = stats.directCount + stats.indirectCount;
 
-Refer your friends and earn 30% of their fees in the first month, 20% in the second and 10% forever!`;
-    await ctx.editMessageText(messageText, {
+    // Construct message
+    const messageText =
+`<b>YOUR REFERRALS (updated every 30 min)</b>
+
+• <b>Users referred:</b> ${totalRefCount} (direct: ${stats.directCount}, indirect: ${stats.indirectCount})
+• <b>Total rewards:</b> ${stats.totalRewards.toFixed(4)} SOL ($${totalRewardsUSD})
+• <b>Total paid:</b> ${stats.totalPaid.toFixed(4)} SOL ($${totalPaidUSD})
+• <b>Total unpaid:</b> ${stats.totalUnpaid.toFixed(4)} SOL ($${totalUnpaidUSD})
+
+<b>Your Reflink:</b>
+<code>${stats.link}</code>
+
+Refer your friends and earn 30% of their fees in the first month, 20% in the second, and 10% forever!
+`;
+
+    await ctx.reply(messageText, {
       parse_mode: 'HTML',
       ...Markup.inlineKeyboard([
-        [Markup.button.callback('🔙 Back to Main Menu', 'back_to_main')]
+        [
+          Markup.button.callback('📷 QR Code', 'referral_qrcode'),
+          Markup.button.callback('❌ Close', 'close_referral_message')
+        ]
       ])
     });
+
     ctx.answerCbQuery();
   } catch (error) {
     console.error('❌ referral_friends Error:', error);
     await ctx.reply('❌ An error occurred while fetching referral data.', { parse_mode: 'HTML' });
+  }
+});
+
+// Action to show the QR Code (with logo in center)
+bot.action('referral_qrcode', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    const botUsername = ctx.me || 'YourBotUsername';
+
+    // Re-fetch stats (or you could store them in session if you want)
+    const stats = await getUserReferralStatsMultiLevel(userId, botUsername);
+    if (!stats.code) {
+      return ctx.reply('❌ No referral info found. Type /start to create an account first.', { parse_mode: 'HTML' });
+    }
+
+    // quickchart.io with centerImageUrl param
+    // Insert your own logo link below
+    const centerLogo = 'https://i.ibb.co/3NJPW5n/logo.png'; // <-- put your real logo link
+    const encodedLink = encodeURIComponent(stats.link);
+    const qrUrl = `https://quickchart.io/qr?size=300&text=${encodedLink}&centerImageUrl=${encodeURIComponent(centerLogo)}`;
+
+    await ctx.replyWithPhoto(qrUrl, {
+      caption: `Here is your referral QR code!\n\n<code>${stats.link}</code>`,
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Close', 'close_referral_qr')]
+      ])
+    });
+
+    ctx.answerCbQuery();
+  } catch (error) {
+    console.error('❌ referral_qrcode Error:', error);
+    await ctx.reply('❌ An error occurred while generating QR code.', { parse_mode: 'HTML' });
+  }
+});
+
+// Action to close the main referral text
+bot.action('close_referral_message', async (ctx) => {
+  try {
+    await ctx.deleteMessage();
+    await ctx.answerCbQuery();
+  } catch (err) {
+    console.error('❌ close_referral_message Error:', err);
+  }
+});
+
+// Action to close the QR code
+bot.action('close_referral_qr', async (ctx) => {
+  try {
+    await ctx.deleteMessage();
+    await ctx.answerCbQuery();
+  } catch (err) {
+    console.error('❌ close_referral_qr Error:', err);
   }
 });
 
@@ -1002,6 +1145,7 @@ bot.on('text', async (ctx) => {
       return;
     }
 
+    // Sending SOL Flow
     if (ctx.session.sendFlow) {
       if (ctx.session.sendFlow.action === 'awaiting_address') {
         const toAddress = ctx.message.text.trim();
@@ -1041,6 +1185,7 @@ bot.on('text', async (ctx) => {
       }
     }
 
+    // Cash Buy Flow
     if (ctx.session.cashBuy) {
       const cashBuy = ctx.session.cashBuy;
       if (cashBuy.step === 'phoneNumber') {
