@@ -1249,8 +1249,8 @@ bot.on('text', async (ctx) => {
         return;
       } else if (cashBuy.step === 'amount') {
         const amount = parseFloat(ctx.message.text);
-        if (isNaN(amount) || amount < 20 || amount > 5000) {
-          await ctx.reply('❌ Please enter a valid amount (minimum $20 and maximum $5000).', { parse_mode: 'HTML' });
+        if (isNaN(amount) || amount < 5 || amount > 5000) {
+          await ctx.reply('❌ Please enter a valid amount (minimum $5 and maximum $5000).', { parse_mode: 'HTML' });
           return;
         }
         cashBuy.amount = amount;
