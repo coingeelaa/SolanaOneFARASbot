@@ -2,9 +2,9 @@
 .env
 
 # Ignore Firebase & Wallet JSON files
-sches-wallet.json
-solana-farasbot-c47d8-firebase-adminsdk-fbsvc-70ac75abf6.json
 privateKeys.json
+sches-wallet.json
+dssa-58488-firebase-adminsdk-fbsvc-554c55cdb8.json
 
 # Node modules
 node_modules/

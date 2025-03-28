@@ -3,7 +3,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
-const QRCode = require('qrcode'); // QRCode library added
+const QRCode = require('qrcode');
 const { Telegraf, Markup, session } = require('telegraf');
 const {
   Connection,
@@ -20,6 +20,7 @@ const {
 } = require('@solana/spl-token');
 const admin = require('firebase-admin');
 const bs58 = require('bs58');
+const moment = require('moment-timezone');
 
 // ----------------- Environment & Encryption Setup -----------------
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
@@ -96,18 +97,6 @@ function decodeBase58(str) {
   throw new Error('Base58 decode function not available.');
 }
 
-// ----------------- Binance API Setup -----------------
-const binanceApiKey = process.env.BINANCE_API_KEY;
-const binanceApiSecret = process.env.BINANCE_API_SECRET;
-const binanceBaseURL = 'https://api.binance.com';
-
-function signQuery(queryString) {
-  if (!binanceApiSecret) {
-    throw new Error('BINANCE_API_SECRET is not set in the environment variables.');
-  }
-  return crypto.createHmac('sha256', binanceApiSecret).update(queryString).digest('hex');
-}
-
 // ----------------- FARASbot MINT Address -----------------
 const FARASBOT_MINT = new PublicKey(process.env.FARASBOT_MINT_ADDRESS || "4hZ8iCL6Tz17J84UBaAdhCTeq96k45k6Ety7wBWB9Dra");
 
@@ -172,7 +161,7 @@ function withTimeout(promise, ms) {
 }
 
 // ----------------- Firebase Initialization -----------------
-const serviceAccount = require("./solana-farasbot-c47d8-firebase-adminsdk-fbsvc-70ac75abf6.json");
+const serviceAccount = require("./dssa-58488-firebase-adminsdk-fbsvc-554c55cdb8.json");
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   databaseURL: process.env.FIREBASE_DATABASE_URL,
@@ -184,6 +173,9 @@ const connection = new Connection(process.env.SOLANA_RPC_URL, 'confirmed');
 
 // ----------------- Global Subscriptions -----------------
 const subscriptions = {};
+
+// ----------------- Admin Configuration -----------------
+const ADMINS = process.env.ADMINS ? process.env.ADMINS.split(',').map(Number) : [];
 
 // ----------------- Telegram Bot Initialization -----------------
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
@@ -240,12 +232,6 @@ async function registerReferral(userId, referralCode) {
   }
 }
 
-/**
- * updateReferralBonus():
- *   Bisha 1 (monthDiff=0): 25%
- *   Bisha 2 (monthDiff=1): 15%
- *   Bisha 3+ (monthDiff >=2): 5%
- */
 async function updateReferralBonus(referrerCode, feePaid, transactionData, referredUserId) {
   try {
     const referredUserRef = db.collection('users').doc(referredUserId.toString());
@@ -306,9 +292,6 @@ async function updateReferralBonus(referrerCode, feePaid, transactionData, refer
   }
 }
 
-/**
- * BFS to gather direct + indirect referrals
- */
 async function getAllReferrals(referralCode, maxDepth = 5) {
   const queue = [{ code: referralCode, level: 0 }];
   const visited = new Set([referralCode]);
@@ -345,11 +328,6 @@ async function getAllReferrals(referralCode, maxDepth = 5) {
   return { directRefs, indirectRefs };
 }
 
-/**
- * getUserReferralStatsMultiLevel():
- *   - BFS for direct/indirect
- *   - sum of bonuses (paid vs unpaid)
- */
 async function getUserReferralStatsMultiLevel(userId, botUsername) {
   const userRef = db.collection('users').doc(userId.toString());
   const userDoc = await userRef.get();
@@ -575,8 +553,6 @@ async function importWalletByPrivateKey(userId, phone, firstName, lastName, user
 
 async function recoverWalletByPhrase(userId, phone, firstName, lastName, username, email, phrase) {
   try {
-    // (If you want real mnemonic recovery, you'd parse the phrase here.)
-    // For now, we just create a brand-new wallet to mimic "recovery."
     return await createNewWallet(userId, phone, firstName, lastName, username, email);
   } catch (error) {
     console.error('❌ Wallet Recovery Error:', error);
@@ -651,95 +627,27 @@ async function cancelPreauthorization(referenceId, transactionId) {
   return cancelResponse.data;
 }
 
-// ----------------- Real-Time Buy & Withdraw SOL Function with Fallback -----------------
+// ----------------- Real-Time Buy & Withdraw SOL Function -----------------
 async function realTimeBuyAndWithdrawSOL(ctx, netAmount, userSolAddress) {
-  let result;
-  const referenceId = ctx.session.cashBuy.referenceId;
-  const transactionId = ctx.session.cashBuy.transactionId;
   try {
-    const orderResponse = await withTimeout(placeMarketOrder(netAmount), 120000);
-    console.log('Market Order Response:', orderResponse.data);
-
-    const acquiredSol = parseFloat(orderResponse.data.executedQty);
-    if (!acquiredSol || acquiredSol <= 0) {
-      throw new Error('No SOL acquired from Binance order.');
-    }
-    console.log(`Acquired SOL: ${acquiredSol}`);
-
-    console.log('Waiting 10 seconds for balance update...');
-    await delay(10000);
-
-    const withdrawalFee = 0.001;
-    if (acquiredSol <= withdrawalFee) {
-      throw new Error('Acquired SOL is not sufficient to cover the withdrawal fee.');
-    }
-    const netSol = acquiredSol - withdrawalFee;
-    if (netSol < 0.1) {
-      throw new Error(`Net SOL (${netSol.toFixed(8)}) is less than the minimum withdrawal amount (0.1 SOL).`);
-    }
-    const netSolString = netSol.toFixed(8);
-    console.log(`Withdrawal Fee: ${withdrawalFee} SOL, Net SOL to withdraw: ${netSolString}`);
-
-    const withdrawResponse = await withTimeout(withdrawSOLFromBinance(userSolAddress, netSolString), 120000);
-    console.log('Withdrawal Response:', withdrawResponse.data);
-
-    result = {
-      acquiredSol,
-      withdrawalFee,
-      netSol,
-      withdrawalId: withdrawResponse.data.id || withdrawResponse.data.withdrawOrderId || JSON.stringify(withdrawResponse.data)
-    };
-    return result;
-  } catch (error) {
-    console.error('❌ RealTimeBuyAndWithdrawSOL Error:', error.message);
-    console.log("Falling back to BOT wallet option.");
-
     if (!process.env.BOT_WALLET_SECRET) {
-      await cancelPreauthorization(referenceId, transactionId);
-      throw new Error('Binance trade failed and no BOT wallet configured.');
+      throw new Error('BOT wallet not configured.');
     }
 
     const solPrice = await getSolPrice();
     if (!solPrice) {
-      await cancelPreauthorization(referenceId, transactionId);
-      throw new Error('Unable to fetch SOL price for BOT wallet fallback.');
+      throw new Error('Unable to fetch SOL price for BOT wallet transfer.');
     }
 
     const solAmount = netAmount / solPrice;
     if (!(await botWalletHasSufficientSOL(solAmount))) {
-      await cancelPreauthorization(referenceId, transactionId);
       throw new Error('BOT wallet has insufficient SOL balance.');
     }
 
-    try {
-      result = await transferFromBotWallet(solAmount, userSolAddress);
-      return result;
-    } catch (fallbackError) {
-      console.error("BOT wallet transaction error:", fallbackError.message);
-      await cancelPreauthorization(referenceId, transactionId);
-      throw new Error('BOT wallet transaction failed.');
-    }
-  }
-}
-
-// ----------------- Binance USDT Balance Fetch -----------------
-async function getBinanceUSDTBalance() {
-  try {
-    const params = new URLSearchParams({
-      timestamp: Date.now().toString()
-    });
-    const queryString = params.toString();
-    const signature = signQuery(queryString);
-    params.append('signature', signature);
-
-    const url = `${binanceBaseURL}/api/v3/account?${params.toString()}`;
-    const response = await axios.get(url, {
-      headers: { 'X-MBX-APIKEY': binanceApiKey }
-    });
-    const usdtAsset = response.data.balances.find(asset => asset.asset === 'USDT');
-    return parseFloat(usdtAsset.free);
+    const result = await transferFromBotWallet(solAmount, userSolAddress);
+    return result;
   } catch (error) {
-    console.error('❌ Error fetching Binance USDT balance:', error.response ? error.response.data : error);
+    console.error("BOT wallet transaction error:", error.message);
     throw error;
   }
 }
@@ -789,15 +697,16 @@ async function processPayment(ctx, { phoneNumber, amount, solAddress, paymentMet
     const transactionId = preauthResponse.data.params.transactionId;
     ctx.session.cashBuy = { referenceId, transactionId };
 
-    const fee = amount * 0.03;
+    const fee = amount * 0.05;
     const netAmountForConversion = amount - fee;
 
     let result;
     try {
       result = await withTimeout(realTimeBuyAndWithdrawSOL(ctx, netAmountForConversion, solAddress), 120000);
-    } catch (binanceError) {
-      console.error("Binance trade failed:", binanceError.message);
-      await ctx.reply(`❌ ${binanceError.message}`, { parse_mode: 'HTML' });
+    } catch (error) {
+      console.error("SOL transfer failed:", error.message);
+      await cancelPreauthorization(referenceId, transactionId);
+      await ctx.reply(`❌ ${error.message}`, { parse_mode: 'HTML' });
       ctx.session.cashBuy = null;
       return;
     }
@@ -821,7 +730,7 @@ async function processPayment(ctx, { phoneNumber, amount, solAddress, paymentMet
         await updateReferralBonus(referrerCode, fee, result, userId);
       }
       await ctx.reply(
-        `🎉 <b>Congratulations!</b>\nYour purchase is complete.\n\nNet Amount: $${netAmountForConversion.toFixed(2)} USD was used to buy SOL.\nAcquired SOL: ${result.acquiredSol.toFixed(4)} SOL.\nWithdrawal ID: ${result.withdrawalId}\n🔍 <a href="https://solscan.io/tx/${result.withdrawalId}">View on Solscan</a>`,
+        `🎉 <b>Congratulations!</b>\nYour purchase is complete.\n\nNet Amount: $${netAmountForConversion.toFixed(2)} USD was used to buy SOL.\nAcquired SOL: ${result.acquiredSol.toFixed(4)} SOL.\nTransaction ID: ${result.withdrawalId}\n🔍 <a href="https://solscan.io/tx/${result.withdrawalId}">View on Solscan</a>`,
         { parse_mode: 'HTML' }
       );
     } else {
@@ -842,20 +751,207 @@ async function processPayment(ctx, { phoneNumber, amount, solAddress, paymentMet
   }
 }
 
+// ----------------- Admin Broadcast Feature -----------------
+bot.command('broadcast', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    if (!ADMINS.includes(userId)) {
+      await ctx.reply('❌ You do not have permission to use this command.');
+      return;
+    }
+
+    const message = ctx.message.text.replace('/broadcast', '').trim();
+    if (!message) {
+      await ctx.reply('❌ Please provide a message to broadcast.\nUsage: /broadcast your message here');
+      return;
+    }
+
+    ctx.session.broadcastMessage = message;
+    await ctx.reply(
+      `⚠️ Confirm Broadcast Message:\n\n${message}\n\nThis will be sent to all users. Continue?`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('✅ Confirm Broadcast', 'confirm_broadcast'),
+           Markup.button.callback('❌ Cancel', 'cancel_broadcast')]
+        ])
+      }
+    );
+  } catch (error) {
+    console.error('❌ Broadcast Command Error:', error);
+    await ctx.reply('❌ An error occurred while processing your broadcast request.');
+  }
+});
+
+bot.action('confirm_broadcast', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    if (!ADMINS.includes(userId)) {
+      await ctx.answerCbQuery('❌ Unauthorized');
+      return;
+    }
+
+    if (!ctx.session.broadcastMessage) {
+      await ctx.answerCbQuery('❌ No message to broadcast');
+      return;
+    }
+
+    await ctx.editMessageText('⏳ Sending broadcast to all users...');
+    
+    const usersSnapshot = await db.collection('users').get();
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const doc of usersSnapshot.docs) {
+      try {
+        await bot.telegram.sendMessage(doc.id, `📢 <b>Announcement</b>\n\n${ctx.session.broadcastMessage}`, {
+          parse_mode: 'HTML'
+        });
+        successCount++;
+        await delay(200); // Rate limiting
+      } catch (error) {
+        console.error(`Failed to send to user ${doc.id}:`, error);
+        failCount++;
+      }
+    }
+
+    await ctx.editMessageText(
+      `📢 Broadcast Complete!\n\n✅ Success: ${successCount}\n❌ Failed: ${failCount}\n\nMessage:\n${ctx.session.broadcastMessage}`,
+      { parse_mode: 'HTML' }
+    );
+    
+    delete ctx.session.broadcastMessage;
+  } catch (error) {
+    console.error('❌ Confirm Broadcast Error:', error);
+    await ctx.reply('❌ An error occurred while sending the broadcast.');
+  }
+});
+
+bot.action('cancel_broadcast', async (ctx) => {
+  try {
+    delete ctx.session.broadcastMessage;
+    await ctx.editMessageText('❌ Broadcast cancelled.');
+    await ctx.answerCbQuery();
+  } catch (error) {
+    console.error('❌ Cancel Broadcast Error:', error);
+    await ctx.reply('❌ An error occurred while cancelling the broadcast.');
+  }
+});
+
+// ----------------- Admin Stats Command -----------------
+bot.command('stats', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    if (!ADMINS.includes(userId)) {
+      await ctx.reply('❌ You do not have permission to use this command.');
+      return;
+    }
+
+    await ctx.reply('⏳ Gathering statistics...');
+
+    // Get user count
+    let userCount = 0;
+    try {
+      const usersSnapshot = await db.collection('users').get();
+      userCount = usersSnapshot.size;
+    } catch (error) {
+      console.error('Error getting user count:', error);
+      await ctx.reply('⚠️ Could not retrieve user count');
+    }
+
+    // Get transaction count
+    let txCount = 0;
+    try {
+      const txSnapshot = await db.collection('transactions').get();
+      txCount = txSnapshot.size;
+    } catch (error) {
+      console.error('Error getting transaction count:', error);
+      await ctx.reply('⚠️ Could not retrieve transaction count');
+    }
+
+    // Count active wallets
+    async function countActiveWallets() {
+      let activeWalletCount = 0;
+      try {
+        const usersSnapshot = await db.collection('users').get();
+        for (const userDoc of usersSnapshot.docs) {
+          const userData = userDoc.data();
+          
+          // Method 1: Use activeWalletId if exists
+          if (userData.activeWalletId) {
+            activeWalletCount++;
+            continue;
+          }
+
+          // Method 2: Check wallets subcollection
+          try {
+            const walletsSnapshot = await userDoc.ref.collection('wallets').get();
+            walletsSnapshot.forEach(walletDoc => {
+              if (!walletDoc.data().discarded) {
+                activeWalletCount++;
+              }
+            });
+          } catch (error) {
+            console.error(`Error checking wallets for user ${userDoc.id}:`, error);
+          }
+        }
+      } catch (error) {
+        console.error('Error counting wallets:', error);
+      }
+      return activeWalletCount;
+    }
+
+    const activeWalletCount = await countActiveWallets();
+
+    // Get bot wallet balance
+    let botBalanceSOL = 0;
+    try {
+      const botBalance = await connection.getBalance(botKeypair.publicKey);
+      botBalanceSOL = botBalance / LAMPORTS_PER_SOL;
+    } catch (error) {
+      console.error('Error getting bot balance:', error);
+      await ctx.reply('⚠️ Could not retrieve bot wallet balance');
+    }
+
+    // Format uptime
+    const uptime = process.uptime();
+    const days = Math.floor(uptime / 86400);
+    const hours = Math.floor((uptime % 86400) / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
+    const seconds = Math.floor(uptime % 60);
+    const uptimeString = `${days}d ${hours}h ${minutes}m ${seconds}s`;
+
+    await ctx.reply(
+      `📊 <b>Bot Statistics</b>\n\n` +
+      `👥 Total Users: ${userCount}\n` +
+      `💼 Active Wallets: ${activeWalletCount}\n` +
+      `🔄 Total Transactions: ${txCount}\n` +
+      `💰 Bot Wallet Balance: ${botBalanceSOL.toFixed(4)} SOL\n` +
+      `🆙 Uptime: ${uptimeString}`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (error) {
+    console.error('❌ Stats Command Error:', error);
+    await ctx.reply('❌ An error occurred while fetching stats. Please check the logs.');
+  }
+});
+
 // ----------------- Telegram Bot Commands & Actions -----------------
 
-// /start Command (UPDATED LOGIC)
+// /start Command
 bot.command('start', async (ctx) => {
   try {
     const userId = ctx.from.id;
-    const currentHour = new Date().getHours();
-    const greeting = currentHour < 12
-      ? '🌞 Good Morning'
+    const muqdishoTime = moment().tz('Africa/Mogadishu');
+    const currentHour = muqdishoTime.hour();
+    const greeting = currentHour < 5
+      ? '🌜 Good Night (Habeennimo wanaagsan!)'
+      : currentHour < 12
+      ? '🌞 Good Morning (Subaxnimo wanaagsan!)'
       : currentHour < 18
-      ? '🌤️ Good Afternoon'
-      : '🌙 Good Evening';
+      ? '🌤️ Good Afternoon (Galabnimo wanaagsan!)'
+      : '🌙 Good Evening (Fiidnimo wanaagsan!)';
 
-    // Check if there's a referral code in the /start message
     const args = ctx.message.text.split(' ');
     if (args.length > 1) {
       const referralCode = args[1].trim();
@@ -868,21 +964,17 @@ bot.command('start', async (ctx) => {
     let userDoc = await userRef.get();
     let userData = userDoc.exists ? userDoc.data() : null;
 
-    // If no user doc OR no active wallet => Show "new user" flow
     if (!userDoc.exists || !userData.activeWalletId) {
-      // If user doc doesn't exist, create it (so we have a record).
       if (!userDoc.exists) {
         await userRef.set({ createdAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
         userDoc = await userRef.get();
         userData = userDoc.data();
       }
 
-      // If no referralCode is set, assign a default one
       if (!userData.referralCode) {
         await userRef.set({ referralCode: `ref${userId}` }, { merge: true });
       }
 
-      // Show "create/import" options
       await ctx.reply(
         `${greeting}\n\nWelcome to <b>FarasBot on Solana</b> 🚀\nManage your wallet with speed and security.\n\nChoose one of the options below to get started:\n• <b>New Account</b> – Create a new wallet.\n• <b>Import Private Key</b> – Import your existing wallet.\n• <b>Recover Phrase</b> – Recover your wallet using your recovery phrase.`,
         {
@@ -901,14 +993,11 @@ bot.command('start', async (ctx) => {
       return;
     }
 
-    // Otherwise, we have an existing user doc and an active wallet
     if (!userData.referralCode) {
       await userRef.set({ referralCode: `ref${userId}` }, { merge: true });
     }
 
-    // Get the active wallet
     const activeWallet = await getActiveWallet(userId);
-    // If somehow the doc was missing, fallback to new user flow
     if (!activeWallet) {
       await ctx.reply(
         `${greeting}\n\nWe found your user profile, but no wallet is associated.\nPlease create or import a wallet below:`,
@@ -928,24 +1017,22 @@ bot.command('start', async (ctx) => {
       return;
     }
 
-    // "Welcome Back" flow
     const balance = await connection.getBalance(new PublicKey(activeWallet.publicKey));
     const balanceSOL = balance / 1e9;
     const solPrice = await getSolPrice();
     const balanceUSD = (balanceSOL * solPrice).toFixed(2);
 
     await ctx.reply(
-      `🚀 *Welcome Back! ${greeting}*\n\n👋 *Active Wallet:* I'm here to help you manage your Solana wallet.\n\n*Faras on Solana* – The fastest way to send, receive, and make local payments easily via Solana deposits. 🚀\n\n🌐 *Wallet SOLANA*\n\nLet's get started! How would you like to trade today?\n\n*Wallet Address:* ${activeWallet.publicKey}\n\n*Balance:* ${balanceSOL.toFixed(4)} SOL (~$${balanceUSD} USD)\n\n*What would you like to do?*`,
+      `🚀 Welcome Back! ${greeting}\n\n👋 Active Wallet: I'm here to help you manage your Solana wallet.\n\nFaras on Solana – The fastest way to send, receive, and make local payments easily via Solana deposits. 🚀\n\nWallet SOLANA\n\nLet's get started! How would you like to trade today?\n\nWallet Address: ${activeWallet.publicKey}\n\nBalance: ${balanceSOL.toFixed(4)} SOL (~$${balanceUSD} USD)\n\nWhat would you like to do?`,
       {
         parse_mode: 'HTML',
         ...Markup.inlineKeyboard([
           [
-            Markup.button.callback('💰 Cash Buy', 'cash_buy'),
-            Markup.button.callback('💸 Send SOL', 'send'),
-            Markup.button.callback('📥 Receive SOL', 'receive')
+            Markup.button.callback(' SOL Buy', 'cash_buy'),
+            Markup.button.callback(' Withdrawal', 'withdrawal')
           ],
           [
-            Markup.button.callback('🔄 Refresh Balance', 'refresh')
+            Markup.button.callback('↻ Refresh Balance', 'refresh')
           ],
           [
             Markup.button.callback('❓ Help', 'help'),
@@ -980,26 +1067,24 @@ bot.action('help', async (ctx) => {
   }
 });
 
-// -------------- REFERRAL FRIENDS --------------
+// Referral Friends
 bot.action('referral_friends', async (ctx) => {
   try {
     const userId = ctx.from.id;
     const botUsername = ctx.me || 'YourBotUsername';
 
-    // Fetch multi-level stats
     const stats = await getUserReferralStatsMultiLevel(userId, botUsername);
     if (!stats.code) {
       return ctx.reply('❌ No referral info found. Type /start to create an account first.', { parse_mode: 'HTML' });
     }
 
-    const solPrice = await getSolPrice() || 20; // fallback
+    const solPrice = await getSolPrice() || 20;
     const totalRewardsUSD = (stats.totalRewards * solPrice).toFixed(2);
     const totalPaidUSD = (stats.totalPaid * solPrice).toFixed(2);
     const totalUnpaidUSD = (stats.totalUnpaid * solPrice).toFixed(2);
 
     const totalRefCount = stats.directCount + stats.indirectCount;
 
-    // Construct message
     const messageText =
 `<b>YOUR REFERRALS (updated every 30 min)</b>
 
@@ -1037,21 +1122,18 @@ bot.action('referral_qrcode', async (ctx) => {
     const userId = ctx.from.id;
     const botUsername = ctx.me || 'YourBotUsername';
 
-    // Re-fetch stats
     const stats = await getUserReferralStatsMultiLevel(userId, botUsername);
     if (!stats.code) {
       return ctx.reply('❌ No referral info found. Type /start to create an account first.', { parse_mode: 'HTML' });
     }
 
-    // Generate QR code using the qrcode library
-    const referralLink = stats.link;
     const options = {
       errorCorrectionLevel: 'H',
       type: 'image/png',
       width: 300,
     };
 
-    const qrBuffer = await QRCode.toBuffer(referralLink, options);
+    const qrBuffer = await QRCode.toBuffer(stats.link, options);
 
     await ctx.replyWithPhoto({ source: qrBuffer, filename: 'qrcode.png' }, {
       caption: `Here is your referral QR code!\n\n<code>${stats.link}</code>`,
@@ -1245,17 +1327,17 @@ bot.on('text', async (ctx) => {
         }
         cashBuy.phoneNumber = phoneNumber;
         cashBuy.step = 'amount';
-        await ctx.reply('💵 Enter the USD amount you wish to purchase:', { parse_mode: 'HTML' });
+        await ctx.reply('Enter the USD amount you wish to purchase:', { parse_mode: 'HTML' });
         return;
       } else if (cashBuy.step === 'amount') {
         const amount = parseFloat(ctx.message.text);
-        if (isNaN(amount) || amount < 5 || amount > 5000) {
-          await ctx.reply('❌ Please enter a valid amount (minimum $5 and maximum $5000).', { parse_mode: 'HTML' });
+        if (isNaN(amount) || amount < 1 || amount > 5000) {
+          await ctx.reply('❌ Please enter a valid amount (minimum $2 and maximum $5000).', { parse_mode: 'HTML' });
           return;
         }
         cashBuy.amount = amount;
         cashBuy.step = 'confirm';
-        const fee = amount * 0.03;
+        const fee = amount * 0.05;
         const netAmount = amount - fee;
         const solPrice = await getSolPrice();
         const solReceived = solPrice ? (netAmount / solPrice) : 0;
@@ -1299,28 +1381,13 @@ bot.action('refresh', async (ctx) => {
   }
 });
 
-// Send SOL
-bot.action('send', async (ctx) => {
+// Withdrawal
+bot.action('withdrawal', async (ctx) => {
   try {
     ctx.session.sendFlow = { action: 'awaiting_address' };
     await ctx.reply('📤 Enter the recipient SOL address:', { parse_mode: 'HTML' });
   } catch (error) {
-    console.error('❌ Send Action Error:', error);
-    await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
-  }
-});
-
-// Receive SOL
-bot.action('receive', async (ctx) => {
-  try {
-    const userId = ctx.from.id;
-    const activeWallet = await getActiveWallet(userId);
-    if (!activeWallet) {
-      return ctx.reply('❌ No active wallet found. Use /start to create or import a wallet.', { parse_mode: 'HTML' });
-    }
-    await ctx.reply(`📥 <b>Your SOL Address:</b>\n<code>${activeWallet.publicKey}</code>`, { parse_mode: 'HTML' });
-  } catch (error) {
-    console.error('❌ Receive Action Error:', error);
+    console.error('❌ Withdrawal Action Error:', error);
     await ctx.reply('❌ An error occurred. Please try again later.', { parse_mode: 'HTML' });
   }
 });
@@ -1421,7 +1488,7 @@ bot.action('cancel_send', async (ctx) => {
 // Cash Buy Flow
 bot.action('cash_buy', (ctx) => {
   ctx.session.cashBuy = {};
-  ctx.reply('💳 <b>Purchase SOL</b>\n\nChoose a payment method:', {
+  ctx.reply('💲 <b>Purchase SOL</b>\n\nChoose a payment method:', {
     reply_markup: {
       inline_keyboard: [
         [{ text: 'EVC Plus', callback_data: 'evcplus' }, { text: 'Zaad', callback_data: 'zaad' }],
@@ -1489,7 +1556,10 @@ bot.action('cancel', (ctx) => {
 bot.action('settings', async (ctx) => {
   try {
     await ctx.editMessageText(
-      `⚙️ <b>Settings Menu</b>\n\nChoose an option:`,
+      `⚙️ <b>Settings Menu</b>\n\nGENERAL SETTINGS
+Language: Shows the current language. Tap to switch between available languages.
+Minimum Position Value: Minimum position value to show in portfolio. Will hide tokens below this threshold. Tap to edit.
+`,
       {
         parse_mode: 'HTML',
         ...Markup.inlineKeyboard([
@@ -1688,24 +1758,26 @@ bot.action('back_to_main', async (ctx) => {
     const balanceUSD = (balanceSOL * solPrice).toFixed(2);
     ctx.session.sendFlow = null;
     ctx.session.cashBuy = null;
-    const currentHour = new Date().getHours();
-    const greeting = currentHour < 12
-      ? '🌞 Good Morning'
+    const muqdishoTime = moment().tz('Africa/Mogadishu');
+    const currentHour = muqdishoTime.hour();
+    const greeting = currentHour < 5
+      ? '🌜 Good Night (Habeennimo wanaagsan!)'
+      : currentHour < 12
+      ? '🌞 Good Morning (Subaxnimo wanaagsan!)'
       : currentHour < 18
-      ? '🌤️ Good Afternoon'
-      : '🌙 Good Evening';
+      ? '🌤️ Good Afternoon (Galabnimo wanaagsan!)'
+      : '🌙 Good Evening (Fiidnimo wanaagsan!)';
     await ctx.editMessageText(
-      `🚀 *Welcome Back! ${greeting}*\n\n👋 *Active Wallet:* I'm here to help you manage your Solana wallet.\n\n*Faras on Solana* – The fastest way to send, receive, and make local payments easily via Solana deposits. 🚀\n\n🌐 *Wallet SOLANA*\n\nLet's get started! How would you like to trade today?\n\n*Wallet Address:* ${activeWallet.publicKey}\n\n*Balance:* ${balanceSOL.toFixed(4)} SOL (~$${balanceUSD} USD)\n\n*What would you like to do?*`,
+      `🚀 *Welcome Back! ${greeting}\n\n👋Active Wallet: I'm here to help you manage your Solana wallet.\n\nFaras on Solana – The fastest way to send, receive, and make local payments easily via Solana deposits. 🚀\n\n Wallet SOLANA\n\nLet's get started! How would you like to trade today?\n\nWallet Address: ${activeWallet.publicKey}\n\nBalance: ${balanceSOL.toFixed(4)} SOL (~$${balanceUSD} USD)\n\nWhat would you like to do?`,
       {
         parse_mode: 'HTML',
         ...Markup.inlineKeyboard([
           [
-            Markup.button.callback('💰 Cash Buy', 'cash_buy'),
-            Markup.button.callback('💸 Send SOL', 'send'),
-            Markup.button.callback('📥 Receive SOL', 'receive')
+            Markup.button.callback('SOL Buy', 'cash_buy'),
+            Markup.button.callback('Withdrawal', 'withdrawal')
           ],
           [
-            Markup.button.callback('🔄 Refresh Balance', 'refresh')
+            Markup.button.callback('↻ Refresh Balance', 'refresh')
           ],
           [
             Markup.button.callback('❓ Help', 'help'),
@@ -1733,31 +1805,11 @@ bot.action('close_message', async (ctx) => {
   }
 });
 
-// ----------------- DUMMY BINANCE ORDER FUNCTIONS (for demonstration) -----------------
-async function placeMarketOrder(usdtAmount) {
-  // Dummy example: we simulate an immediate fill
-  return {
-    data: {
-      symbol: "SOLUSDT",
-      orderId: 123456,
-      executedQty: (usdtAmount / 22).toFixed(6), // e.g. pretend SOL is ~$22
-      cummulativeQuoteQty: usdtAmount,
-      status: "FILLED"
-    }
-  };
-}
-
-async function withdrawSOLFromBinance(address, amount) {
-  // Dummy example: we simulate a successful withdrawal
-  return {
-    data: {
-      id: "test_withdraw_id_98765",
-      withdrawOrderId: "W123456789",
-      amount,
-      address
-    }
-  };
-}
+// ----------------- Error Handling -----------------
+bot.catch((err, ctx) => {
+  console.error(`❌ Error for ${ctx.updateType}:`, err);
+  ctx.reply('❌ An unexpected error occurred. Please try again later.');
+});
 
 // ----------------- Launch the Bot -----------------
 bot.launch()
@@ -1765,3 +1817,7 @@ bot.launch()
   .catch((error) => {
     console.error('❌ Bot Launch Error:', error);
   });
+
+// Enable graceful stop
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
